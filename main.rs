@@ -2,16 +2,26 @@
 
 use futures::prelude::*;
 use libp2p::{
+    core::upgrade,
     identity,
     kad::{
-        record::store::MemoryStore, GetClosestPeersOk, Kademlia, KademliaConfig, KademliaEvent,
-        QueryId, QueryResult,
+        record::store::MemoryStore, record::store::RecordStore, AddProviderOk, GetProvidersOk,
+        Kademlia, KademliaConfig, KademliaEvent, PeerRecord, PutRecordOk, QueryResult, Quorum,
+        Record,
     },
-    swarm::{NetworkBehaviourEventProcess, Swarm, SwarmEvent},
-    Multiaddr, NetworkBehaviour, PeerId,
+    mplex, noise,
+    swarm::{NetworkBehaviourEventProcess, Swarm, SwarmBuilder, SwarmEvent},
+    tcp::TokioTcpConfig,
+    Multiaddr, NetworkBehaviour, PeerId, Transport,
 };
-use std::{collections::HashMap, error::Error, time::Duration};
-use tokio::time::{sleep, timeout};
+use log::{error, info, warn};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    error::Error,
+    time::{Duration, Instant},
+};
+use tokio::time::{interval, sleep};
 
 /// A simple reputation system where each peer has a score.
 struct ReputationSystem {
@@ -41,6 +51,18 @@ impl ReputationSystem {
     }
 }
 
+/// Our custom record value structure.
+#[derive(Serialize, Deserialize, Debug)]
+struct MyRecordValue {
+    data: String,
+}
+
+impl MyRecordValue {
+    fn new(data: String) -> Self {
+        MyRecordValue { data }
+    }
+}
+
 /// Define the network behaviour combining Kademlia and the reputation system.
 #[derive(NetworkBehaviour)]
 #[behaviour(event_process = true)]
@@ -53,24 +75,51 @@ struct MyBehaviour {
 impl NetworkBehaviourEventProcess<KademliaEvent> for MyBehaviour {
     fn inject_event(&mut self, event: KademliaEvent) {
         match event {
-            // Handle events where we receive a request from a peer.
+            // Handle inbound requests.
             KademliaEvent::InboundRequest { request } => {
                 let peer = request.source;
-                println!("Received request from {:?}", peer);
+                info!("Received request from {:?}", peer);
                 self.reputation.increase(&peer);
             }
-            // Handle the completion of outbound queries.
+            // Handle outbound query completions.
             KademliaEvent::OutboundQueryCompleted { result, .. } => match result {
-                QueryResult::GetClosestPeers(Ok(GetClosestPeersOk { peers, .. })) => {
-                    for peer in &peers {
-                        println!("Found peer {:?}", peer);
+                QueryResult::GetClosestPeers(Ok(ok)) => {
+                    for peer in &ok.peers {
+                        info!("Found peer {:?}", peer);
                         self.reputation.increase(peer);
                     }
                 }
                 QueryResult::GetClosestPeers(Err(err)) => {
-                    let peer = err.peer;
-                    println!("Failed to find peer {:?}: {:?}", peer, err.error);
-                    self.reputation.decrease(&peer);
+                    warn!("Failed to find peers: {:?}", err);
+                    // Decrease reputation of peers involved.
+                }
+                QueryResult::GetRecord(Ok(ok)) => {
+                    for PeerRecord { record, .. } in ok.records {
+                        if let Ok(value) = serde_json::from_slice::<MyRecordValue>(&record.value) {
+                            info!(
+                                "Received record for key {:?}: {:?}",
+                                String::from_utf8_lossy(&record.key),
+                                value
+                            );
+                        } else {
+                            warn!("Failed to deserialize record value.");
+                        }
+                    }
+                }
+                QueryResult::GetRecord(Err(err)) => {
+                    warn!("Failed to get record: {:?}", err);
+                }
+                QueryResult::PutRecord(Ok(PutRecordOk { key })) => {
+                    info!("Successfully put record with key {:?}", key);
+                }
+                QueryResult::PutRecord(Err(err)) => {
+                    warn!("Failed to put record: {:?}", err);
+                }
+                QueryResult::Bootstrap(Ok(_)) => {
+                    info!("Bootstrap successful");
+                }
+                QueryResult::Bootstrap(Err(err)) => {
+                    warn!("Bootstrap failed: {:?}", err);
                 }
                 _ => {}
             },
@@ -81,36 +130,55 @@ impl NetworkBehaviourEventProcess<KademliaEvent> for MyBehaviour {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // Initialize logging
+    env_logger::init();
+
     // Generate a random PeerId.
     let local_key = identity::Keypair::generate_ed25519();
     let local_peer_id = PeerId::from(local_key.public());
-    println!("Local peer id: {:?}", local_peer_id);
+    info!("Local peer id: {:?}", local_peer_id);
 
     // Set up the transport.
-    let transport = libp2p::development_transport(local_key.clone()).await?;
+    let noise_keys = noise::Keypair::<noise::X25519Spec>::new()
+        .into_authentic(&local_key)
+        .expect("Signing libp2p-noise static DH keypair failed.");
+    let transport = TokioTcpConfig::new()
+        .nodelay(true)
+        .upgrade(upgrade::Version::V1)
+        .authenticate(noise::NoiseConfig::xx(noise_keys).into_authenticated())
+        .multiplex(mplex::MplexConfig::new())
+        .boxed();
 
-    // Create a Kademlia behaviour.
+    // Create a Kademlia behaviour with advanced configuration.
     let store = MemoryStore::new(local_peer_id);
     let mut cfg = KademliaConfig::default();
-    cfg.set_query_timeout(Duration::from_secs(5));
+    cfg.set_kbucket_inserts(libp2p::kad::KademliaBucketInserts::Manual);
+    cfg.set_query_timeout(Duration::from_secs(10));
     let mut kademlia = Kademlia::with_config(local_peer_id, store, cfg);
 
-    // Add bootstrap nodes if available (replace with actual addresses if you have them).
+    // Add bootstrap nodes if available.
     // For example:
-    // let bootstrap_peer_id = PeerId::from_str("Qm...")?;
+    // let bootstrap_peer_id = PeerId::from_str("12D3KooW...")?;
     // let bootstrap_addr: Multiaddr = "/ip4/127.0.0.1/tcp/8080".parse()?;
     // kademlia.add_address(&bootstrap_peer_id, bootstrap_addr);
 
     // Combine Kademlia with the reputation system.
-    let mut behaviour = MyBehaviour {
+    let behaviour = MyBehaviour {
         kademlia,
         reputation: ReputationSystem::new(),
     };
 
-    let mut swarm = Swarm::new(transport, behaviour, local_peer_id);
+    let mut swarm = SwarmBuilder::new(transport, behaviour, local_peer_id)
+        .executor(Box::new(|fut| {
+            tokio::spawn(fut);
+        }))
+        .build();
 
     // Listen on all interfaces and a random OS-assigned port.
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+
+    // Start periodic tasks.
+    let mut refresh_interval = interval(Duration::from_secs(60));
 
     // Start the swarm.
     loop {
@@ -120,26 +188,38 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     // Events are handled in the inject_event method.
                 }
                 SwarmEvent::NewListenAddr { address, .. } => {
-                    println!("Listening on {:?}", address);
+                    info!("Listening on {:?}", address);
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                    println!("Connected to {:?}", peer_id);
+                    info!("Connected to {:?}", peer_id);
                 }
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                    println!("Disconnected from {:?}", peer_id);
+                    info!("Disconnected from {:?}", peer_id);
                 }
                 _ => {}
             },
             _ = sleep(Duration::from_secs(10)) => {
                 // Periodically print out the reputation scores.
-                println!("Current reputations:");
+                info!("Current reputations:");
                 for (peer, score) in &swarm.behaviour().reputation.scores {
-                    println!("{:?} => {}", peer, score);
+                    info!("{:?} => {}", peer, score);
                 }
 
                 // Periodically search for more peers.
                 let random_peer = PeerId::random();
                 swarm.behaviour_mut().kademlia.get_closest_peers(random_peer);
+            },
+            _ = refresh_interval.tick() => {
+                // Refresh buckets and republish records.
+                info!("Refreshing routing table and republishing records.");
+                swarm.behaviour_mut().kademlia.bootstrap()?;
+
+                // Republish all records.
+                for record in swarm.behaviour().kademlia.store().records() {
+                    let key = record.key.clone();
+                    swarm.behaviour_mut().kademlia.put_record(record.into_owned(), Quorum::One)?;
+                    info!("Republishing record with key {:?}", key);
+                }
             }
         }
     }
