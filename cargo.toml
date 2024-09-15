@@ -1,4 +1,13 @@
+[package]
+name = "kademlia_reputation"
+version = "0.2.0"
+edition = "2021"
+
 [dependencies]
 libp2p = { version = "0.51", features = ["kad"] }
 futures = "0.3"
 tokio = { version = "1", features = ["full"] }
+log = "0.4"
+env_logger = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
